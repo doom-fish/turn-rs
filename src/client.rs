@@ -411,19 +411,16 @@ impl TurnClient {
     }
 
     /// Send `payload` over a previously bound `channel` as a ChannelData frame
-    /// (RFC 5766 §11.4). Padding follows the transport: padded over UDP,
-    /// unpadded over a stream transport (§11.5).
+    /// (RFC 5766 §11.4). The frame is always padded to a 4-byte boundary,
+    /// which is REQUIRED over stream transports and permitted over UDP
+    /// (RFC 5766 §11.5, RFC 8656 §12.4).
     ///
     /// # Errors
     ///
     /// Returns [`Error::InvalidChannelNumber`] for an out-of-range channel, or
     /// a transport error.
     pub fn send_channel(&self, channel: u16, payload: &[u8]) -> Result<()> {
-        let frame = if self.transport.is_stream() {
-            ChannelData::encode_stream(channel, payload)?
-        } else {
-            ChannelData::encode(channel, payload)?
-        };
+        let frame = ChannelData::encode(channel, payload)?;
         self.transport.send(&frame)
     }
 

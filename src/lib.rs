@@ -20,7 +20,8 @@
 //!   `XOR-PEER-ADDRESS` / `XOR-RELAYED-ADDRESS`, layered on
 //!   [`stun::Attribute::Unknown`].
 //! * [ChannelData][channel] framing with first-byte STUN/ChannelData
-//!   demultiplexing and transport-aware padding (RFC 5766 §11.5).
+//!   demultiplexing and RFC-compliant 4-byte padding (RFC 5766 §11.5,
+//!   RFC 8656 §12.4).
 //! * The mandatory long-term [auth] mechanism with a `REALM`/`NONCE`
 //!   refresh state machine (`401` → re-send, `438` → re-send).
 //! * [Allocation][allocation], [permission], and

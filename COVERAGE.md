@@ -55,14 +55,15 @@ codec is private to `stun-rs`, an identical implementation lives in this crate's
 `attribute` module. The transaction ID is set explicitly on each request so the
 key can be precomputed.
 
-## ChannelData padding (RFC 5766 §11.5)
+## ChannelData padding (RFC 5766 §11.5, RFC 8656 §12.4)
 
 ChannelData frames carry a 4-byte header (channel number + length) followed by
-the payload. This crate applies **4-byte alignment padding on datagram
-transports (UDP)** and **no padding on stream transports (TCP/TLS)**, exposed as
-`ChannelData::encode` and `ChannelData::encode_stream` respectively. The decoder
-accepts both, returning exactly `Length` payload bytes and ignoring any trailing
-padding. This split is enforced by the `padding_rules` test suite.
+the payload. This crate **always pads** frames to a 4-byte boundary because
+padding is REQUIRED over stream transports (TCP / TLS-over-TCP) and is
+permitted (RECOMMENDED) over UDP. The `Length` field records the unpadded
+payload length, so the decoder always returns exactly `Length` payload bytes
+and discards trailing padding regardless of transport. This is enforced by the
+`padding_rules` test suite.
 
 ## Authentication
 

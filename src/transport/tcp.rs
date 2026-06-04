@@ -7,9 +7,9 @@
 //!
 //! * STUN messages (`0x0000..=0x3FFF`): total length is `20 + message_length`,
 //!   where `message_length` (the body) is already a multiple of four.
-//! * ChannelData frames (`0x4000..=0x7FFF`): total length is `4 + Length`;
-//!   this client does not pad ChannelData on stream transports (RFC 5766
-//!   §11.5).
+//! * ChannelData frames (`0x4000..=0x7FFF`): wire length is `4 + Length`
+//!   rounded up to a 4-byte boundary; padding is REQUIRED over stream
+//!   transports per RFC 5766 §11.5 and RFC 8656 §12.4.
 
 use std::sync::Mutex;
 
@@ -64,7 +64,13 @@ fn framed_len(buf: &[u8]) -> Option<usize> {
     let declared = usize::from(u16::from_be_bytes([buf[2], buf[3]]));
     let total = match channel::classify(buf) {
         PacketKind::Stun => 20 + declared,
-        PacketKind::ChannelData => 4 + declared,
+        PacketKind::ChannelData => {
+            // ChannelData over a stream transport MUST be padded to a 4-byte
+            // boundary (RFC 5766 §11.5, RFC 8656 §12.4). The Length field
+            // excludes the padding, so round up to consume it.
+            let unpadded = 4 + declared;
+            (unpadded + 3) & !3
+        }
         PacketKind::Unknown => return Some(0), // signal framing error
     };
     (buf.len() >= total).then_some(total)

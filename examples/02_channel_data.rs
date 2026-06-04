@@ -26,17 +26,14 @@ fn main() {
     let channel = 0x4000;
     let payload = b"relayed application payload";
 
-    // Datagram framing (UDP): padded to a 4-byte boundary.
-    let datagram = ChannelData::encode(channel, payload).expect("encode");
-    println!("ChannelData (UDP, padded), {} bytes:", datagram.len());
-    println!("  {}", hex(&datagram));
+    // ChannelData frames are always padded to a 4-byte boundary (REQUIRED
+    // over TCP / TLS-over-TCP per RFC 5766 §11.5 and RFC 8656 §12.4,
+    // permitted over UDP).
+    let frame = ChannelData::encode(channel, payload).expect("encode");
+    println!("ChannelData frame, {} bytes:", frame.len());
+    println!("  {}", hex(&frame));
 
-    // Stream framing (TCP/TLS): no trailing padding.
-    let stream = ChannelData::encode_stream(channel, payload).expect("encode_stream");
-    println!("ChannelData (TCP, unpadded), {} bytes:", stream.len());
-    println!("  {}", hex(&stream));
-
-    let (decoded_channel, decoded_payload) = ChannelData::decode(&datagram).expect("decode");
+    let (decoded_channel, decoded_payload) = ChannelData::decode(&frame).expect("decode");
     assert_eq!(decoded_channel, channel);
     assert_eq!(decoded_payload, payload);
     println!(
@@ -47,9 +44,9 @@ fn main() {
     // Demultiplexing: the first byte distinguishes STUN (0x00-0x3F) from
     // ChannelData (0x40-0x7F).
     println!("\nDemux:");
-    println!("  channel frame -> {:?}", classify(&datagram));
+    println!("  channel frame -> {:?}", classify(&frame));
     let stun_like = [0x00u8, 0x01, 0x00, 0x00];
     println!("  STUN message  -> {:?}", classify(&stun_like));
-    assert_eq!(classify(&datagram), PacketKind::ChannelData);
+    assert_eq!(classify(&frame), PacketKind::ChannelData);
     assert_eq!(classify(&stun_like), PacketKind::Stun);
 }

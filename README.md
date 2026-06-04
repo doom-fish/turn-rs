@@ -26,7 +26,8 @@ NAT fail.
   `ADDITIONAL-ADDRESS-FAMILY`, with their own XOR-address codec layered on
   `stun::Attribute::Unknown`.
 - **ChannelData** — 4-byte framing with first-byte STUN/ChannelData
-  demultiplexing and transport-aware padding (RFC 5766 §11.5).
+  demultiplexing and RFC-compliant 4-byte padding (RFC 5766 §11.5,
+  RFC 8656 §12.4).
 - **Long-term auth** — the mandatory `MESSAGE-INTEGRITY` mechanism with the full
   `401` challenge → re-send and `438` stale-nonce → re-send state machine, keyed
   on `MD5(username:realm:password)` from `stun-rs`.

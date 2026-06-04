@@ -30,7 +30,7 @@ flags; this crate calls into it transitively, not directly.
 | `CreatePermission` | 5766 §9 | ✅ | — |
 | `Send` / `Data` indications | 5766 §10 | ✅ unauthenticated | — |
 | `ChannelBind` + ChannelData | 5766 §11 | ✅ | — |
-| ChannelData padding | 5766 §11.5 | ⚠️ see note | UDP-padded / TCP-unpadded split |
+| ChannelData padding | 5766 §11.5 / 8656 §12.4 | ✅ always padded | REQUIRED on TCP/TLS, permitted on UDP |
 | XOR address codec | 5766 §14.3/§14.5 | ✅ IPv4 + IPv6 | re-implemented (stun codec is private) |
 | `EVEN-PORT` / `RESERVATION-TOKEN` | 5766 §14.6/§14.9 | ✅ encode/decode | server-side reservation not exercised |
 | Dual-stack relays | 8656 §14.7/§14.9 | ⚠️ attributes only | no happy-eyeballs ordering |
@@ -42,14 +42,6 @@ flags; this crate calls into it transitively, not directly.
 
 ## Honest notes
 
-- **ChannelData padding is inverted from the literal reading of RFC 5766
-  §11.5.** That section pads ChannelData over stream transports and makes
-  padding optional over datagram transports. This crate instead pads on UDP
-  (`ChannelData::encode`) and does not pad on TCP/TLS
-  (`ChannelData::encode_stream`), per the project's transport model, and the
-  `padding_rules` test suite pins that behaviour. The decoder is tolerant: it
-  returns exactly `Length` payload bytes and ignores trailing padding, so it
-  interoperates with either convention on receive.
 - **TLS is framed identically to TCP and is not live-tested.** `turns:` selects
   a TLS transport that reuses the TCP length-prefixed reassembler; it compiles
   and is exercised by unit tests through the shared framing code, but there is

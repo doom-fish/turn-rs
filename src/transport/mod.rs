@@ -13,8 +13,10 @@
 //!   (`turns:`).
 //!
 //! Over a stream transport, STUN messages are implicitly padded to a 4-byte
-//! boundary while ChannelData frames are **not** padded (RFC 5766 §11.5); the
-//! reassembler accounts for both.
+//! boundary by the protocol; ChannelData frames are padded by this crate per
+//! RFC 5766 §11.5 and RFC 8656 §12.4 (padding REQUIRED on TCP/TLS, permitted
+//! on UDP). The reassembler rounds the declared ChannelData `Length` up to a
+//! 4-byte boundary to consume the padding.
 
 pub mod tcp;
 pub mod tls;
@@ -42,7 +44,8 @@ pub trait Transport: Send + Sync {
     /// Returns [`crate::Error::Network`] on a transport failure.
     fn receive(&self) -> Result<Vec<u8>>;
 
-    /// Whether this is a stream transport (TCP/TLS). Stream transports do not
-    /// pad ChannelData frames (RFC 5766 §11.5).
+    /// Whether this is a stream transport (TCP/TLS). Reserved for future use
+    /// (RFC 6062 `Connect`/`ConnectionBind` flows); ChannelData padding is
+    /// now uniform across all transports per RFC 5766 §11.5 / RFC 8656 §12.4.
     fn is_stream(&self) -> bool;
 }

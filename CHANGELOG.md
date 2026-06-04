@@ -21,8 +21,9 @@ Initial release.
   `DATA`, `REQUESTED-ADDRESS-FAMILY`, `EVEN-PORT`, `REQUESTED-TRANSPORT`,
   `DONT-FRAGMENT`, `RESERVATION-TOKEN`, and `ADDITIONAL-ADDRESS-FAMILY`.
 - ChannelData framing with first-byte STUN/ChannelData demultiplexing
-  (`classify`) and transport-aware padding: datagram frames are padded to a
-  4-byte boundary, stream frames are not (RFC 5766 §11.5).
+  (`classify`) and RFC-compliant 4-byte padding on every frame (RFC 5766
+  §11.5, RFC 8656 §12.4: padding REQUIRED on TCP / TLS-over-TCP and
+  permitted on UDP).
 - Long-term authentication state machine: unauthenticated request → `401`
   challenge (capturing `REALM`/`NONCE`) → re-send with `MESSAGE-INTEGRITY`, with
   `438` stale-nonce refresh.

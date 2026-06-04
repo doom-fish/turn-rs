@@ -70,57 +70,36 @@ pub fn classify(bytes: &[u8]) -> PacketKind {
 pub struct ChannelData;
 
 impl ChannelData {
-    /// Encode a ChannelData frame for transmission over UDP.
+    /// Encode a ChannelData frame.
     ///
-    /// Over UDP the frame is padded with zero bytes to a 4-byte boundary
-    /// (RFC 5766 §11.5). The `Length` field still records the *unpadded*
-    /// payload length.
+    /// The frame is always padded with zero bytes to a 4-byte boundary. Padding
+    /// is **REQUIRED** over stream transports (TCP / TLS-over-TCP) per RFC 5766
+    /// §11.5 and RFC 8656 §12.4, and is permitted (RECOMMENDED) over datagram
+    /// transports (UDP). The `Length` field always records the *unpadded*
+    /// payload length, so the receiver discards trailing padding regardless of
+    /// transport.
     ///
     /// # Errors
     ///
     /// Returns [`Error::InvalidChannelNumber`] if `channel` is outside
     /// `0x4000..=0x7FFF`.
     pub fn encode(channel: u16, payload: &[u8]) -> Result<Vec<u8>> {
-        Self::encode_inner(channel, payload, true)
-    }
-
-    /// Encode a ChannelData frame for transmission over a stream transport
-    /// (TCP / TLS).
-    ///
-    /// Over TCP the frame is **not** padded, because the framing is recovered
-    /// from the explicit `Length` field rather than datagram boundaries
-    /// (RFC 5766 §11.5).
-    ///
-    /// # Errors
-    ///
-    /// Returns [`Error::InvalidChannelNumber`] if `channel` is out of range.
-    pub fn encode_stream(channel: u16, payload: &[u8]) -> Result<Vec<u8>> {
-        Self::encode_inner(channel, payload, false)
-    }
-
-    fn encode_inner(channel: u16, payload: &[u8], pad: bool) -> Result<Vec<u8>> {
         if !is_valid_channel(channel) {
             return Err(Error::InvalidChannelNumber(channel));
         }
         let len = u16::try_from(payload.len())
             .map_err(|_| Error::BadChannelData("payload exceeds 65535 bytes"))?;
-        let mut out = Vec::with_capacity(HEADER_LEN + payload.len() + 3);
+        let padding = (4 - (payload.len() % 4)) % 4;
+        let mut out = Vec::with_capacity(HEADER_LEN + payload.len() + padding);
         out.extend_from_slice(&channel.to_be_bytes());
         out.extend_from_slice(&len.to_be_bytes());
         out.extend_from_slice(payload);
-        if pad {
-            let padding = (4 - (payload.len() % 4)) % 4;
-            out.extend(std::iter::repeat(0u8).take(padding));
-        }
+        out.extend(std::iter::repeat(0u8).take(padding));
         Ok(out)
     }
 
     /// Decode a ChannelData frame, returning the channel number and a borrow of
     /// the payload (without header or padding).
-    ///
-    /// Accepts both padded (UDP) and unpadded (TCP) frames: only the first
-    /// `Length` payload bytes after the header are returned, and any trailing
-    /// padding is ignored.
     ///
     /// # Errors
     ///
