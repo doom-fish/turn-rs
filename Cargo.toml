@@ -1,0 +1,41 @@
+[package]
+name = "turn-rs"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.76"
+license = "MIT OR Apache-2.0"
+description = "Pure-Rust TURN (RFC 5766 / RFC 8656) client layered on stun-rs, with Allocate/Refresh/Send/Data/CreatePermission/ChannelBind, ChannelData framing, and long-term auth"
+authors = ["Per Johansson <per@doom.fish>"]
+homepage = "https://github.com/doom-fish/turn-rs"
+repository = "https://github.com/doom-fish/turn-rs"
+keywords = ["turn", "stun", "ice", "webrtc", "nat"]
+categories = ["network-programming", "os::macos-apis"]
+readme = "README.md"
+build = "build.rs"
+publish = false
+
+[lib]
+name = "turn"
+path = "src/lib.rs"
+crate-type = ["lib"]
+
+[dependencies]
+libc = "0.2"
+stun = { path = "../stun-rs", package = "stun-rs" }
+networkframework = { path = "../networkframework-rs" }
+
+[[example]]
+name = "01_allocate"
+path = "examples/01_allocate.rs"
+
+[[example]]
+name = "02_channel_data"
+path = "examples/02_channel_data.rs"
+
+[[example]]
+name = "03_live_allocate"
+path = "examples/03_live_allocate.rs"
+
+[profile.release]
+opt-level = 3
+lto = true
