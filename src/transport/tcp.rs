@@ -114,6 +114,10 @@ impl Transport for TcpTransport {
         }
     }
 
+    fn close(&self) {
+        self.socket.force_cancel();
+    }
+
     fn is_stream(&self) -> bool {
         true
     }

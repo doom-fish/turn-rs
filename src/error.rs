@@ -25,7 +25,9 @@ pub enum Error {
     AuthRequired,
     /// A `401` / `438` challenge was missing its `REALM` or `NONCE`.
     MissingChallenge,
-    /// The server kept rejecting an authenticated request (nonce loop).
+    /// The server rejected the credentials, the challenge named a different
+    /// realm than the credential, or the server kept rejecting an
+    /// authenticated request (nonce loop).
     AuthFailed,
     /// A required attribute was absent from a success response.
     MissingAttribute(&'static str),
@@ -37,6 +39,12 @@ pub enum Error {
     InvalidState(&'static str),
     /// The requested address family is not supported.
     UnsupportedAddressFamily(u8),
+    #[allow(missing_docs)]
+    IntegrityViolation,
+    #[allow(missing_docs)]
+    PasswordAlgorithms(&'static str),
+    #[allow(missing_docs)]
+    Crypto(&'static str),
 }
 
 impl fmt::Display for Error {
@@ -53,7 +61,7 @@ impl fmt::Display for Error {
             Self::MissingChallenge => {
                 f.write_str("authentication challenge missing REALM or NONCE")
             }
-            Self::AuthFailed => f.write_str("authentication failed after nonce refresh"),
+            Self::AuthFailed => f.write_str("TURN authentication failed"),
             Self::MissingAttribute(what) => write!(f, "response missing attribute: {what}"),
             Self::BadChannelData(what) => write!(f, "malformed ChannelData frame: {what}"),
             Self::InvalidChannelNumber(n) => {
@@ -63,6 +71,11 @@ impl fmt::Display for Error {
             Self::UnsupportedAddressFamily(family) => {
                 write!(f, "unsupported address family: {family:#04x}")
             }
+            Self::IntegrityViolation => f.write_str(
+                "no response to the TURN transaction passed the integrity and authentication checks",
+            ),
+            Self::PasswordAlgorithms(what) => write!(f, "password algorithm negotiation failed: {what}"),
+            Self::Crypto(what) => write!(f, "platform crypto error: {what}"),
         }
     }
 }

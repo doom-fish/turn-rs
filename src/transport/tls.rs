@@ -42,6 +42,10 @@ impl Transport for TlsTransport {
         self.inner.receive()
     }
 
+    fn close(&self) {
+        self.inner.close();
+    }
+
     fn is_stream(&self) -> bool {
         true
     }

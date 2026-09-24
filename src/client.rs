@@ -3,33 +3,38 @@
 //! [`TurnClient`] drives the full client side of RFC 5766 / RFC 8656:
 //! `Allocate`, `Refresh`, `CreatePermission`, `ChannelBind`, `Send`/`Data`
 //! indications, and ChannelData framing. It is fully synchronous — no async
-//! runtime is pulled in. A background receiver thread feeds inbound packets to
-//! an [`std::sync::mpsc`] channel so the caller can drive RFC 5389
-//! retransmission timers (reused from `stun-rs`) without blocking forever on
-//! the callback-based Network.framework receive primitive.
+//! runtime is pulled in. A background receiver thread sorts inbound packets so
+//! the caller can drive RFC 5389 retransmission timers (reused from `stun-rs`)
+//! without blocking forever on the callback-based Network.framework receive
+//! primitive.
 //!
-//! Control responses, `Data` indications, and ChannelData frames all arrive on
-//! the same channel; the client demultiplexes them by transaction ID and by
-//! the leading-bytes rule of [`crate::channel::classify`], stashing relayed
-//! data for [`TurnClient::recv`] while it waits for a matching response.
+//! Control responses go to the transaction waiting for them, matched by
+//! transaction ID and accepted only once `MESSAGE-INTEGRITY` (or
+//! `MESSAGE-INTEGRITY-SHA256`) verifies with the long-term key. `Data`
+//! indications and ChannelData frames, told apart by the leading-bytes rule of
+//! [`crate::channel::classify`], go to a bounded pending queue that
+//! [`TurnClient::recv`] drains; when it is full the oldest frame is dropped and
+//! counted.
 
 use std::collections::VecDeque;
+use std::fmt;
 use std::net::{IpAddr, SocketAddr};
 use std::str::FromStr;
-use std::sync::mpsc;
-use std::sync::Arc;
-use std::thread;
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
+use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use stun::transaction::RetransmitSchedule;
+use stun::attribute::types as stun_types;
+use stun::transaction::{RetransmitSchedule, DEFAULT_RTO};
 use stun::{Attribute as StunAttribute, Class, Message, TransactionId};
 
 use crate::allocation::{Allocation, DEFAULT_LIFETIME};
 use crate::attribute::{self, AddressFamily, Attribute, EvenPort, PROTOCOL_UDP};
-use crate::auth::{AuthState, Credential};
+use crate::auth::{self, AuthState, Credential};
 use crate::channel::{self, ChannelData, PacketKind, MAX_CHANNEL, MIN_CHANNEL};
 use crate::channel_binding::ChannelBinding;
 use crate::error::{Error, Result};
+use crate::indication;
 use crate::method::Method;
 use crate::permission::Permission;
 use crate::transport::{tcp::TcpTransport, tls::TlsTransport, udp::UdpTransport, Transport};
@@ -41,7 +46,17 @@ pub const DEFAULT_TURNS_PORT: u16 = 5349;
 
 /// The maximum number of authentication retries for a single transaction
 /// (initial unauthenticated attempt, then `401` and `438` re-sends).
-const MAX_AUTH_ATTEMPTS: usize = 4;
+const MAX_AUTH_ATTEMPTS: usize = 5;
+
+#[allow(missing_docs)]
+pub const DEFAULT_PENDING_CAPACITY: usize = 256;
+
+#[allow(missing_docs)]
+pub const DROP_CLOSE_TIMEOUT: Duration = Duration::from_secs(1);
+
+const RESPONSE_CAPACITY: usize = 32;
+const RECEIVER_GRACE: Duration = Duration::from_millis(100);
+const RESERVED_ATTRIBUTES: [u16; 7] = [0x0000, 0x0002, 0x0003, 0x0004, 0x0005, 0x0007, 0x000B];
 
 /// The transport scheme selected by a TURN URI.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -168,25 +183,156 @@ impl Default for AllocateOptions {
     }
 }
 
+enum Relayed {
+    Data(SocketAddr, Vec<u8>),
+    Channel(Vec<u8>),
+}
+
+struct InboxState {
+    responses: VecDeque<Message>,
+    pending: VecDeque<Relayed>,
+    capacity: usize,
+    dropped: u64,
+    closed: Option<String>,
+}
+
+impl InboxState {
+    fn stash(&mut self, relayed: Relayed) {
+        if self.capacity == 0 {
+            self.dropped += 1;
+            return;
+        }
+        while self.pending.len() >= self.capacity {
+            self.pending.pop_front();
+            self.dropped += 1;
+        }
+        self.pending.push_back(relayed);
+    }
+}
+
+struct Inbox {
+    state: Mutex<InboxState>,
+    ready: Condvar,
+}
+
+impl Inbox {
+    fn new() -> Self {
+        Self {
+            state: Mutex::new(InboxState {
+                responses: VecDeque::new(),
+                pending: VecDeque::new(),
+                capacity: DEFAULT_PENDING_CAPACITY,
+                dropped: 0,
+                closed: None,
+            }),
+            ready: Condvar::new(),
+        }
+    }
+
+    fn lock(&self) -> MutexGuard<'_, InboxState> {
+        self.state.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn deliver(&self, datagram: &[u8]) {
+        let mut state = self.lock();
+        match channel::classify(datagram) {
+            PacketKind::ChannelData => state.stash(Relayed::Channel(datagram.to_vec())),
+            PacketKind::Stun => match Message::decode(datagram) {
+                Ok(message)
+                    if matches!(
+                        message.class(),
+                        Class::SuccessResponse | Class::ErrorResponse
+                    ) =>
+                {
+                    if state.responses.len() >= RESPONSE_CAPACITY {
+                        state.responses.pop_front();
+                    }
+                    state.responses.push_back(message);
+                }
+                Ok(message) => match indication::decode_data(&message) {
+                    Ok(Some((peer, data))) => state.stash(Relayed::Data(peer, data)),
+                    _ => return,
+                },
+                Err(_) => return,
+            },
+            PacketKind::Unknown => return,
+        }
+        drop(state);
+        self.ready.notify_all();
+    }
+
+    fn close(&self, reason: String) {
+        self.lock().closed.get_or_insert(reason);
+        self.ready.notify_all();
+    }
+
+    fn wait<'a>(
+        &self,
+        state: MutexGuard<'a, InboxState>,
+        deadline: Option<Instant>,
+    ) -> Option<MutexGuard<'a, InboxState>> {
+        match deadline {
+            None => Some(
+                self.ready
+                    .wait(state)
+                    .unwrap_or_else(PoisonError::into_inner),
+            ),
+            Some(deadline) => {
+                let remaining = deadline
+                    .checked_duration_since(Instant::now())
+                    .filter(|remaining| !remaining.is_zero())?;
+                Some(
+                    self.ready
+                        .wait_timeout(state, remaining)
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .0,
+                )
+            }
+        }
+    }
+}
+
+struct Attempt {
+    transaction_id: TransactionId,
+    auth: AuthState,
+}
+
+enum Reply {
+    Accepted { attempt: usize, message: Message },
+    Retry(AuthState),
+}
+
+enum Judgement {
+    Accept,
+    Retry(AuthState),
+    Reject,
+    Discard { rejection: bool },
+    Fail(Error),
+}
+
 /// A synchronous TURN client bound to a single server connection.
 pub struct TurnClient {
     transport: Arc<dyn Transport>,
-    rx: mpsc::Receiver<Vec<u8>>,
+    inbox: Arc<Inbox>,
+    receiver: Option<JoinHandle<()>>,
     credential: Credential,
     auth: AuthState,
     allocation: Option<Allocation>,
     permissions: Vec<Permission>,
     bindings: Vec<ChannelBinding>,
-    pending: VecDeque<(SocketAddr, Vec<u8>)>,
     next_channel: u16,
+    rto: Duration,
+    closed: bool,
 }
 
-impl std::fmt::Debug for TurnClient {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Debug for TurnClient {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("TurnClient")
             .field("allocation", &self.allocation)
             .field("permissions", &self.permissions.len())
             .field("bindings", &self.bindings.len())
+            .field("auth", &self.auth)
+            .field("closed", &self.closed)
             .finish_non_exhaustive()
     }
 }
@@ -208,26 +354,58 @@ impl TurnClient {
             Scheme::Tcp => Arc::new(TcpTransport::connect(&uri.host, uri.port)?),
             Scheme::Tls => Arc::new(TlsTransport::connect(&uri.host, uri.port)?),
         };
-        Ok(Self::with_transport(transport, credential))
+        Self::with_transport(transport, credential)
     }
 
     /// Construct a client over an already-established [`Transport`]. Useful for
     /// testing with an in-memory transport.
-    #[must_use]
-    pub fn with_transport(transport: Arc<dyn Transport>, credential: Credential) -> Self {
-        let (tx, rx) = mpsc::channel::<Vec<u8>>();
-        spawn_receiver(Arc::clone(&transport), tx);
-        Self {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Network`] if the receiver thread cannot be started.
+    pub fn with_transport(transport: Arc<dyn Transport>, credential: Credential) -> Result<Self> {
+        let inbox = Arc::new(Inbox::new());
+        let receiver = spawn_receiver(Arc::clone(&transport), Arc::clone(&inbox))?;
+        Ok(Self {
             transport,
-            rx,
+            inbox,
+            receiver: Some(receiver),
             credential,
             auth: AuthState::new(),
             allocation: None,
             permissions: Vec::new(),
             bindings: Vec::new(),
-            pending: VecDeque::new(),
             next_channel: MIN_CHANNEL,
+            rto: DEFAULT_RTO,
+            closed: false,
+        })
+    }
+
+    #[allow(missing_docs)]
+    pub fn set_rto(&mut self, rto: Duration) {
+        self.rto = rto;
+    }
+
+    #[allow(missing_docs)]
+    pub fn set_pending_capacity(&mut self, capacity: usize) {
+        let mut state = self.inbox.lock();
+        state.capacity = capacity;
+        while state.pending.len() > capacity {
+            state.pending.pop_front();
+            state.dropped += 1;
         }
+    }
+
+    #[allow(missing_docs)]
+    #[must_use]
+    pub fn dropped_frames(&self) -> u64 {
+        self.inbox.lock().dropped
+    }
+
+    #[allow(missing_docs)]
+    #[must_use]
+    pub const fn auth_state(&self) -> &AuthState {
+        &self.auth
     }
 
     /// The current allocation, if one has been obtained.
@@ -248,6 +426,9 @@ impl TurnClient {
     /// [`Error::Timeout`] on no response, or a decode error on a malformed
     /// success response.
     pub fn allocate(&mut self, options: &AllocateOptions) -> Result<Allocation> {
+        if self.allocation.is_some() {
+            return Err(Error::InvalidState("an allocation already exists"));
+        }
         let mut attrs = vec![
             Attribute::RequestedTransport(options.requested_transport),
             Attribute::Lifetime(u32::try_from(options.lifetime.as_secs()).unwrap_or(u32::MAX)),
@@ -268,7 +449,7 @@ impl TurnClient {
             attrs.push(Attribute::ReservationToken(token));
         }
 
-        let response = self.authed_request(Method::Allocate, &attrs)?;
+        let response = self.authed_request(Method::Allocate, &attrs, None)?;
 
         let mut relayed = None;
         let mut secondary = None;
@@ -320,7 +501,7 @@ impl TurnClient {
             return Err(Error::InvalidState("no allocation to refresh"));
         }
         let secs = u32::try_from(lifetime.as_secs()).unwrap_or(u32::MAX);
-        let response = self.authed_request(Method::Refresh, &[Attribute::Lifetime(secs)])?;
+        let response = self.authed_request(Method::Refresh, &[Attribute::Lifetime(secs)], None)?;
 
         if secs == 0 {
             self.allocation = None;
@@ -354,7 +535,7 @@ impl TurnClient {
             .iter()
             .map(|p| Attribute::XorPeerAddress(*p))
             .collect();
-        self.authed_request(Method::CreatePermission, &attrs)?;
+        self.authed_request(Method::CreatePermission, &attrs, None)?;
         for peer in peers {
             self.upsert_permission(peer.ip());
         }
@@ -370,15 +551,10 @@ impl TurnClient {
     /// # Errors
     ///
     /// Returns a transport error if the send fails.
-    pub fn send_to(&mut self, peer: SocketAddr, payload: &[u8]) -> Result<()> {
-        let tid = TransactionId::random();
-        let key = attribute::xor_key(tid.as_bytes());
-        let bytes = Message::builder(Method::Send.to_stun(), Class::Indication)
-            .transaction_id(tid)
-            .attribute(Attribute::XorPeerAddress(peer).to_stun(&key))
-            .attribute(Attribute::Data(payload.to_vec()).to_stun(&key))
-            .build_and_encode()?;
-        self.transport.send(&bytes)
+    pub fn send_to(&self, peer: SocketAddr, payload: &[u8]) -> Result<()> {
+        self.ensure_open()?;
+        self.transport
+            .send(&indication::encode_send(peer, payload)?)
     }
 
     /// Bind a channel to `peer` for compact ChannelData framing (RFC 5766 §11),
@@ -403,6 +579,7 @@ impl TurnClient {
                 Attribute::ChannelNumber(channel),
                 Attribute::XorPeerAddress(peer),
             ],
+            None,
         )?;
         self.upsert_binding(channel, peer);
         // A channel bind also refreshes the peer's permission (RFC 5766 §11.2).
@@ -420,27 +597,38 @@ impl TurnClient {
     /// Returns [`Error::InvalidChannelNumber`] for an out-of-range channel, or
     /// a transport error.
     pub fn send_channel(&self, channel: u16, payload: &[u8]) -> Result<()> {
+        self.ensure_open()?;
         let frame = ChannelData::encode(channel, payload)?;
         self.transport.send(&frame)
     }
 
-    /// Block until relayed data arrives, returning the peer address and the
-    /// payload. Accepts both `Data` indications and ChannelData frames.
+    /// Wait for relayed data, returning the peer address and the payload.
+    /// Accepts both `Data` indications and ChannelData frames; a `timeout` of
+    /// `None` waits indefinitely. `Data` indications from peers without a
+    /// permission, ChannelData on unbound channels, and malformed frames are
+    /// skipped.
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Network`] if the transport closes, or a decode error on
-    /// a malformed inbound message.
-    pub fn recv(&mut self) -> Result<(SocketAddr, Vec<u8>)> {
-        if let Some(item) = self.pending.pop_front() {
-            return Ok(item);
-        }
+    /// Returns [`Error::Timeout`] if `timeout` elapses first, or
+    /// [`Error::Network`] if the transport closes.
+    pub fn recv(&mut self, timeout: Option<Duration>) -> Result<(SocketAddr, Vec<u8>)> {
+        self.ensure_open()?;
+        let deadline = timeout.map(|timeout| Instant::now() + timeout);
         loop {
-            let datagram = self
-                .rx
-                .recv()
-                .map_err(|_| Error::Network("transport receiver closed".into()))?;
-            if let Some(item) = self.process_inbound(&datagram)? {
+            let relayed = {
+                let mut state = self.inbox.lock();
+                loop {
+                    if let Some(relayed) = state.pending.pop_front() {
+                        break relayed;
+                    }
+                    if let Some(reason) = &state.closed {
+                        return Err(Error::Network(format!("TURN transport closed: {reason}")));
+                    }
+                    state = self.inbox.wait(state, deadline).ok_or(Error::Timeout)?;
+                }
+            };
+            if let Some(item) = self.accept_relayed(relayed) {
                 return Ok(item);
             }
         }
@@ -467,15 +655,13 @@ impl TurnClient {
             self.refresh(lifetime)?;
         }
 
-        let stale_perms: Vec<IpAddr> = self
+        let stale_perms: Vec<SocketAddr> = self
             .permissions
             .iter()
             .filter(|p| p.refresh_due())
-            .map(Permission::ip)
+            .map(|p| SocketAddr::new(p.ip(), 0))
             .collect();
-        for ip in stale_perms {
-            self.create_permission(&[SocketAddr::new(ip, 0)])?;
-        }
+        let mut outcome = self.create_permission(&stale_perms);
 
         let stale_bindings: Vec<SocketAddr> = self
             .bindings
@@ -484,9 +670,15 @@ impl TurnClient {
             .map(ChannelBinding::peer)
             .collect();
         for peer in stale_bindings {
-            self.channel_bind(peer)?;
+            if let Err(error) = self.channel_bind(peer) {
+                if outcome.is_ok() {
+                    outcome = Err(error);
+                }
+            }
         }
-        Ok(())
+        self.permissions.retain(|p| !p.is_expired());
+        self.bindings.retain(|b| !b.is_expired());
+        outcome
     }
 
     /// The soonest [`Duration`] until any tracked object next needs a refresh,
@@ -522,163 +714,248 @@ impl TurnClient {
         &self.bindings
     }
 
+    #[allow(missing_docs)]
+    pub fn close(&mut self, timeout: Duration) -> Result<()> {
+        if self.closed {
+            return Ok(());
+        }
+        let deadline = Instant::now() + timeout;
+        let released = if self.allocation.is_some() {
+            self.authed_request(Method::Refresh, &[Attribute::Lifetime(0)], Some(deadline))
+                .map(drop)
+        } else {
+            Ok(())
+        };
+        self.closed = true;
+        self.allocation = None;
+        self.permissions.clear();
+        self.bindings.clear();
+        self.transport.close();
+        let joined = self.join_receiver(deadline.max(Instant::now() + RECEIVER_GRACE));
+        released.and(joined)
+    }
+
+    fn join_receiver(&mut self, deadline: Instant) -> Result<()> {
+        let Some(receiver) = self.receiver.take() else {
+            return Ok(());
+        };
+        while !receiver.is_finished() {
+            if Instant::now() >= deadline {
+                return Err(Error::Network(
+                    "TURN receiver thread did not stop before the deadline".to_owned(),
+                ));
+            }
+            thread::sleep(Duration::from_millis(2));
+        }
+        receiver
+            .join()
+            .map_err(|_| Error::Network("TURN receiver thread panicked".to_owned()))
+    }
+
+    fn ensure_open(&self) -> Result<()> {
+        if self.closed {
+            Err(Error::InvalidState("client closed"))
+        } else {
+            Ok(())
+        }
+    }
+
     /// Run a request transaction with the long-term-auth retry loop, returning
     /// the decoded success response.
-    fn authed_request(&mut self, method: Method, attrs: &[Attribute]) -> Result<Message> {
-        for _ in 0..MAX_AUTH_ATTEMPTS {
-            let tid = TransactionId::random();
-            let bytes = self.build_request(tid, method, attrs)?;
-            let response = self.transact(tid, &bytes)?;
-
-            match response.class() {
-                Class::SuccessResponse => return Ok(response),
-                Class::ErrorResponse => {
-                    let (code, reason) = error_code(&response).ok_or(Error::Server {
-                        code: 0,
-                        reason: "no ERROR-CODE".into(),
-                    })?;
-                    match code {
-                        401 => self.handle_challenge(&response, false)?,
-                        438 => self.handle_challenge(&response, true)?,
-                        _ => return Err(Error::Server { code, reason }),
-                    }
+    fn authed_request(
+        &mut self,
+        method: Method,
+        attrs: &[Attribute],
+        deadline: Option<Instant>,
+    ) -> Result<Message> {
+        self.ensure_open()?;
+        let mut attempts: Vec<Attempt> = Vec::with_capacity(MAX_AUTH_ATTEMPTS);
+        let mut auth = self.auth.clone();
+        while attempts.len() < MAX_AUTH_ATTEMPTS {
+            let transaction_id = TransactionId::try_random()?;
+            let request = self.build_request(transaction_id, method, attrs, &auth)?;
+            attempts.push(Attempt {
+                transaction_id,
+                auth,
+            });
+            match self.transact(method, &request, &attempts, deadline)? {
+                Reply::Accepted { attempt, message } => {
+                    self.auth = attempts.swap_remove(attempt).auth;
+                    return match message.class() {
+                        Class::SuccessResponse => Ok(message),
+                        _ => Err(server_error(&message)),
+                    };
                 }
-                _ => return Err(Error::Stun(stun::Error::BadMessageType)),
+                Reply::Retry(next) => auth = next,
             }
         }
         Err(Error::AuthFailed)
     }
 
-    /// Capture `REALM`/`NONCE` (or just the fresh `NONCE` for a stale-nonce
-    /// retry) from a challenge response and update the auth state.
-    fn handle_challenge(&mut self, response: &Message, stale_only: bool) -> Result<()> {
-        let nonce = match response.get(stun::attribute::types::NONCE) {
-            Some(StunAttribute::Nonce(n)) => n.clone(),
-            _ => return Err(Error::MissingChallenge),
-        };
-        if stale_only && self.auth.is_ready() {
-            self.auth.refresh_nonce(&nonce);
-            return Ok(());
-        }
-        let realm = match response.get(stun::attribute::types::REALM) {
-            Some(StunAttribute::Realm(r)) => r.clone(),
-            _ => return Err(Error::MissingChallenge),
-        };
-        self.auth.challenge(&self.credential, &realm, &nonce);
-        Ok(())
-    }
-
-    /// Build a request's wire bytes, attaching credentials + `MESSAGE-INTEGRITY`
-    /// once the auth state is ready.
+    /// Build a request's wire bytes, attaching credentials and message
+    /// integrity once the auth state is ready.
     fn build_request(
         &self,
-        tid: TransactionId,
+        transaction_id: TransactionId,
         method: Method,
         attrs: &[Attribute],
+        auth: &AuthState,
     ) -> Result<Vec<u8>> {
-        let key = attribute::xor_key(tid.as_bytes());
-        let mut builder = Message::builder(method.to_stun(), Class::Request).transaction_id(tid);
+        let key = attribute::xor_key(transaction_id.as_bytes());
+        let mut builder =
+            Message::builder(method.to_stun(), Class::Request).transaction_id(transaction_id);
         for attr in attrs {
             builder = builder.attribute(attr.to_stun(&key));
         }
-        if let (Some(realm), Some(nonce), Some(long_key)) =
-            (self.auth.realm(), self.auth.nonce(), self.auth.key())
-        {
-            builder = builder
-                .attribute(StunAttribute::Username(
-                    self.credential.username().to_owned(),
-                ))
-                .attribute(StunAttribute::Realm(realm.to_owned()))
-                .attribute(StunAttribute::Nonce(nonce.to_owned()))
-                .with_message_integrity_sha1(long_key);
-        }
-        Ok(builder.build_and_encode()?)
+        Ok(auth
+            .sign(builder, self.credential.username())
+            .with_fingerprint()
+            .build_and_encode()?)
     }
 
     /// Send a request and wait for the matching response, driving RFC 5389
-    /// retransmission. Inbound relayed data seen while waiting is stashed for
-    /// [`TurnClient::recv`].
-    fn transact(&mut self, tid: TransactionId, request: &[u8]) -> Result<Message> {
+    /// retransmission. Relayed data seen while waiting stays in the pending
+    /// queue for [`TurnClient::recv`].
+    fn transact(
+        &self,
+        method: Method,
+        request: &[u8],
+        attempts: &[Attempt],
+        deadline: Option<Instant>,
+    ) -> Result<Reply> {
+        let current = attempts.len() - 1;
+        let stream = self.transport.is_stream();
+        let mut discarded = false;
+        let mut rejected = false;
+        let waits: Vec<Duration> = if stream {
+            vec![RetransmitSchedule::with_rto(self.rto).sum()]
+        } else {
+            RetransmitSchedule::with_rto(self.rto).collect()
+        };
         self.transport.send(request)?;
-        let mut schedule = RetransmitSchedule::new().peekable();
-        while let Some(wait) = schedule.next() {
-            let started = Instant::now();
-            while let Some(remaining) = wait.checked_sub(started.elapsed()) {
-                match self.rx.recv_timeout(remaining) {
-                    Ok(datagram) => {
-                        if channel::classify(&datagram) == PacketKind::Stun {
-                            if let Ok(message) = Message::decode(&datagram) {
-                                if message.transaction_id() == &tid
-                                    && matches!(
-                                        message.class(),
-                                        Class::SuccessResponse | Class::ErrorResponse
-                                    )
-                                {
-                                    return Ok(message);
-                                }
-                            }
-                        }
-                        // Not our response: it may be relayed data — stash it.
-                        let _ = self.process_inbound(&datagram)?;
+        for (sent, wait) in waits.iter().enumerate() {
+            let mut until = Instant::now() + *wait;
+            if let Some(deadline) = deadline {
+                until = until.min(deadline);
+            }
+            while let Some(message) = self.next_response(until)? {
+                let Some(index) = attempts
+                    .iter()
+                    .position(|attempt| &attempt.transaction_id == message.transaction_id())
+                else {
+                    continue;
+                };
+                if message.method() != method.to_stun() {
+                    continue;
+                }
+                match self.judge(&message, &attempts[index].auth, index == current) {
+                    Judgement::Accept => {
+                        return Ok(Reply::Accepted {
+                            attempt: index,
+                            message,
+                        })
                     }
-                    Err(mpsc::RecvTimeoutError::Timeout) => break,
-                    Err(mpsc::RecvTimeoutError::Disconnected) => {
-                        return Err(Error::Network("transport receiver closed".into()))
+                    Judgement::Retry(next) => return Ok(Reply::Retry(next)),
+                    Judgement::Reject => return Err(Error::AuthFailed),
+                    Judgement::Fail(error) => return Err(error),
+                    Judgement::Discard { rejection } => {
+                        discarded = true;
+                        rejected |= rejection;
+                        if stream {
+                            break;
+                        }
                     }
                 }
             }
-            if schedule.peek().is_some() {
+            if deadline.is_some_and(|deadline| Instant::now() >= deadline) || (stream && discarded)
+            {
+                break;
+            }
+            if sent + 1 < waits.len() {
                 self.transport.send(request)?;
             }
         }
-        Err(Error::Timeout)
+        Err(if rejected {
+            Error::AuthFailed
+        } else if discarded {
+            Error::IntegrityViolation
+        } else {
+            Error::Timeout
+        })
     }
 
-    /// Classify and decode an inbound packet. Returns `Some((peer, data))` for
-    /// relayed data (a `Data` indication or ChannelData frame), or `None` for
-    /// anything else (which is either consumed or ignored).
-    fn process_inbound(&mut self, datagram: &[u8]) -> Result<Option<(SocketAddr, Vec<u8>)>> {
-        match channel::classify(datagram) {
-            PacketKind::ChannelData => {
-                let (channel, payload) = ChannelData::decode(datagram)?;
-                if let Some(peer) = self
-                    .bindings
-                    .iter()
-                    .find(|b| b.channel() == channel)
-                    .map(ChannelBinding::peer)
-                {
-                    return Ok(Some((peer, payload.to_vec())));
-                }
-                Ok(None)
+    fn next_response(&self, until: Instant) -> Result<Option<Message>> {
+        let mut state = self.inbox.lock();
+        loop {
+            if let Some(message) = state.responses.pop_front() {
+                return Ok(Some(message));
             }
-            PacketKind::Stun => {
-                let message = match Message::decode(datagram) {
-                    Ok(m) => m,
-                    Err(_) => return Ok(None),
-                };
-                if message.method() != Method::Data.to_stun()
-                    || message.class() != Class::Indication
-                {
-                    return Ok(None);
-                }
-                let key = response_key(&message);
-                let mut peer = None;
-                let mut data = None;
-                for attr in message.attributes() {
-                    if let Some(turn) = Attribute::from_stun(attr, &key)? {
-                        match turn {
-                            Attribute::XorPeerAddress(addr) => peer = Some(addr),
-                            Attribute::Data(bytes) => data = Some(bytes),
-                            _ => {}
-                        }
+            if let Some(reason) = &state.closed {
+                return Err(Error::Network(format!("TURN transport closed: {reason}")));
+            }
+            match self.inbox.wait(state, Some(until)) {
+                Some(next) => state = next,
+                None => return Ok(None),
+            }
+        }
+    }
+
+    fn judge(&self, message: &Message, auth: &AuthState, current: bool) -> Judgement {
+        if message.get(stun_types::FINGERPRINT).is_some() && message.verify_fingerprint().is_err() {
+            return Judgement::Discard { rejection: false };
+        }
+        let code = if message.class() == Class::ErrorResponse {
+            error_code(message).map(|(code, _)| code)
+        } else {
+            None
+        };
+        if auth.verify(message) {
+            let unknown = unknown_attributes(message);
+            if !unknown.is_empty() {
+                return Judgement::Fail(Error::Stun(stun::Error::UnknownAttributes(unknown)));
+            }
+            return match code {
+                Some(438) if current => auth
+                    .with_stale_nonce(message)
+                    .map_or(Judgement::Discard { rejection: false }, Judgement::Retry),
+                Some(438) => Judgement::Discard { rejection: false },
+                Some(401) => Judgement::Reject,
+                _ => Judgement::Accept,
+            };
+        }
+        if !current {
+            return Judgement::Discard { rejection: false };
+        }
+        match code {
+            Some(401) if !self.auth.is_ready() => {
+                match AuthState::from_challenge(&self.credential, message) {
+                    Ok(next) if auth.is_ready() && next.realm() == auth.realm() => {
+                        Judgement::Reject
                     }
-                }
-                match (peer, data) {
-                    (Some(peer), Some(data)) => Ok(Some((peer, data))),
-                    _ => Ok(None),
+                    Ok(next) => Judgement::Retry(next),
+                    Err(_) => Judgement::Discard { rejection: true },
                 }
             }
-            PacketKind::Unknown => Ok(None),
+            Some(401) => Judgement::Discard { rejection: true },
+            Some(438) if auth.is_ready() => auth
+                .with_stale_nonce(message)
+                .map_or(Judgement::Discard { rejection: false }, Judgement::Retry),
+            _ => Judgement::Discard { rejection: false },
+        }
+    }
+
+    fn accept_relayed(&self, relayed: Relayed) -> Option<(SocketAddr, Vec<u8>)> {
+        match relayed {
+            Relayed::Data(peer, data) => self
+                .permissions
+                .iter()
+                .any(|p| p.ip() == peer.ip() && !p.is_expired())
+                .then_some((peer, data)),
+            Relayed::Channel(frame) => {
+                let (number, payload) = ChannelData::decode(&frame).ok()?;
+                let peer = self.bindings.iter().find(|b| b.channel() == number)?.peer();
+                Some((peer, payload.to_vec()))
+            }
         }
     }
 
@@ -721,9 +998,7 @@ impl Drop for TurnClient {
     fn drop(&mut self) {
         // Gracefully release the allocation with a zero-lifetime Refresh
         // (RFC 5766 §7). Best-effort: ignore any error during teardown.
-        if self.allocation.is_some() {
-            let _ = self.refresh(Duration::from_secs(0));
-        }
+        let _ = self.close(DROP_CLOSE_TIMEOUT);
     }
 }
 
@@ -740,6 +1015,29 @@ fn error_code(message: &Message) -> Option<(u16, String)> {
     }
 }
 
+fn server_error(message: &Message) -> Error {
+    match error_code(message) {
+        Some((401, _)) => Error::AuthFailed,
+        Some((code, reason)) => Error::Server { code, reason },
+        None => Error::Server {
+            code: 0,
+            reason: "no ERROR-CODE".into(),
+        },
+    }
+}
+
+fn unknown_attributes(message: &Message) -> Vec<u16> {
+    message
+        .unknown_comprehension_required()
+        .into_iter()
+        .filter(|attribute_type| {
+            !attribute::is_turn_attribute(*attribute_type)
+                && !RESERVED_ATTRIBUTES.contains(attribute_type)
+                && *attribute_type != auth::USERHASH
+        })
+        .collect()
+}
+
 /// Extract the granted `LIFETIME` from a response, if present.
 fn granted_lifetime(message: &Message) -> Option<Duration> {
     let key = response_key(message);
@@ -751,16 +1049,18 @@ fn granted_lifetime(message: &Message) -> Option<Duration> {
     None
 }
 
-/// Spawn a detached receiver thread forwarding inbound packets to `tx`.
-fn spawn_receiver(transport: Arc<dyn Transport>, tx: mpsc::Sender<Vec<u8>>) {
-    thread::spawn(move || {
-        while let Ok(datagram) = transport.receive() {
-            if datagram.is_empty() {
-                continue;
-            }
-            if tx.send(datagram).is_err() {
-                break;
-            }
-        }
-    });
+fn spawn_receiver(transport: Arc<dyn Transport>, inbox: Arc<Inbox>) -> Result<JoinHandle<()>> {
+    thread::Builder::new()
+        .name("turn-receiver".to_owned())
+        .spawn(move || {
+            let reason = loop {
+                match transport.receive() {
+                    Ok(datagram) if datagram.is_empty() => {}
+                    Ok(datagram) => inbox.deliver(&datagram),
+                    Err(error) => break error.to_string(),
+                }
+            };
+            inbox.close(reason);
+        })
+        .map_err(|e| Error::Network(e.to_string()))
 }

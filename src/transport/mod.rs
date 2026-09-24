@@ -44,6 +44,9 @@ pub trait Transport: Send + Sync {
     /// Returns [`crate::Error::Network`] on a transport failure.
     fn receive(&self) -> Result<Vec<u8>>;
 
+    #[allow(missing_docs)]
+    fn close(&self);
+
     /// Whether this is a stream transport (TCP/TLS). Reserved for future use
     /// (RFC 6062 `Connect`/`ConnectionBind` flows); ChannelData padding is
     /// now uniform across all transports per RFC 5766 §11.5 / RFC 8656 §12.4.

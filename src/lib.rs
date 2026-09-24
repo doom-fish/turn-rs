@@ -23,15 +23,17 @@
 //!   demultiplexing and RFC-compliant 4-byte padding (RFC 5766 §11.5,
 //!   RFC 8656 §12.4).
 //! * The mandatory long-term [auth] mechanism with a `REALM`/`NONCE`
-//!   refresh state machine (`401` → re-send, `438` → re-send).
+//!   refresh state machine (`401` → re-send, `438` → re-send),
+//!   `PASSWORD-ALGORITHMS` negotiation (RFC 8489 §9.2), and responses
+//!   authenticated with the long-term key before they are acted on.
 //! * [Allocation][allocation], [permission], and
 //!   [channel binding][channel_binding] lifetime accounting with cooperative
 //!   auto-refresh.
 //! * A synchronous [`TurnClient`] over [UDP][transport::udp],
 //!   [TCP][transport::tcp], and [TLS][transport::tls].
 //!
-//! There are no third-party runtime dependencies: only `libc` and the sibling
-//! `stun-rs` / `networkframework` crates.
+//! The only third-party runtime dependency is `zeroize`; everything else comes
+//! from the sibling `stun-rs`, `cryptokit-rs`, and `networkframework` crates.
 //!
 //! # Example
 //!
@@ -54,7 +56,7 @@
 //! client.send_channel(channel, b"hello again")?;
 //!
 //! client.refresh(Duration::from_secs(600))?;
-//! drop(client); // sends Refresh with LIFETIME=0
+//! client.close(Duration::from_secs(2))?;
 //! # Ok(())
 //! # }
 //! ```
@@ -72,6 +74,8 @@ pub mod channel;
 pub mod channel_binding;
 pub mod client;
 pub mod error;
+#[allow(missing_docs)]
+pub mod indication;
 pub mod method;
 pub mod permission;
 pub mod transport;

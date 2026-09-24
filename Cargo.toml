@@ -22,6 +22,7 @@ crate-type = ["lib"]
 [dependencies]
 stun = { path = "../stun-rs", package = "stun-rs", version = ">=0.2, <0.3" }
 networkframework = { path = "../networkframework-rs", version = ">=0.14, <0.15" }
+cryptokit = { path = "../cryptokit-rs", package = "cryptokit-rs", version = ">=0.3, <0.4" }
 zeroize = ">=1.6, <1.9"
 
 [[example]]
@@ -33,8 +34,8 @@ name = "02_channel_data"
 path = "examples/02_channel_data.rs"
 
 [[example]]
-name = "03_live_allocate"
-path = "examples/03_live_allocate.rs"
+name = "03_loopback_allocate"
+path = "examples/03_loopback_allocate.rs"
 
 [profile.release]
 opt-level = 3
