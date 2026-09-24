@@ -501,7 +501,16 @@ impl TurnClient {
             return Err(Error::InvalidState("no allocation to refresh"));
         }
         let secs = u32::try_from(lifetime.as_secs()).unwrap_or(u32::MAX);
-        let response = self.authed_request(Method::Refresh, &[Attribute::Lifetime(secs)], None)?;
+        let response =
+            match self.authed_request(Method::Refresh, &[Attribute::Lifetime(secs)], None) {
+                Err(Error::Server { code: 437, reason }) => {
+                    self.allocation = None;
+                    self.permissions.clear();
+                    self.bindings.clear();
+                    return Err(Error::Server { code: 437, reason });
+                }
+                outcome => outcome?,
+            };
 
         if secs == 0 {
             self.allocation = None;
@@ -614,7 +623,7 @@ impl TurnClient {
     /// [`Error::Network`] if the transport closes.
     pub fn recv(&mut self, timeout: Option<Duration>) -> Result<(SocketAddr, Vec<u8>)> {
         self.ensure_open()?;
-        let deadline = timeout.map(|timeout| Instant::now() + timeout);
+        let deadline = timeout.and_then(|timeout| Instant::now().checked_add(timeout));
         loop {
             let relayed = {
                 let mut state = self.inbox.lock();
@@ -719,9 +728,9 @@ impl TurnClient {
         if self.closed {
             return Ok(());
         }
-        let deadline = Instant::now() + timeout;
+        let deadline = Instant::now().checked_add(timeout);
         let released = if self.allocation.is_some() {
-            self.authed_request(Method::Refresh, &[Attribute::Lifetime(0)], Some(deadline))
+            self.authed_request(Method::Refresh, &[Attribute::Lifetime(0)], deadline)
                 .map(drop)
         } else {
             Ok(())
@@ -731,16 +740,17 @@ impl TurnClient {
         self.permissions.clear();
         self.bindings.clear();
         self.transport.close();
-        let joined = self.join_receiver(deadline.max(Instant::now() + RECEIVER_GRACE));
+        let joined = self
+            .join_receiver(deadline.map(|deadline| deadline.max(Instant::now() + RECEIVER_GRACE)));
         released.and(joined)
     }
 
-    fn join_receiver(&mut self, deadline: Instant) -> Result<()> {
+    fn join_receiver(&mut self, deadline: Option<Instant>) -> Result<()> {
         let Some(receiver) = self.receiver.take() else {
             return Ok(());
         };
         while !receiver.is_finished() {
-            if Instant::now() >= deadline {
+            if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
                 return Err(Error::Network(
                     "TURN receiver thread did not stop before the deadline".to_owned(),
                 ));
@@ -834,10 +844,11 @@ impl TurnClient {
         };
         self.transport.send(request)?;
         for (sent, wait) in waits.iter().enumerate() {
-            let mut until = Instant::now() + *wait;
-            if let Some(deadline) = deadline {
-                until = until.min(deadline);
-            }
+            let until = match (Instant::now().checked_add(*wait), deadline) {
+                (Some(until), Some(deadline)) => Some(until.min(deadline)),
+                (until, None) => until,
+                (None, deadline) => deadline,
+            };
             while let Some(message) = self.next_response(until)? {
                 let Some(index) = attempts
                     .iter()
@@ -884,7 +895,7 @@ impl TurnClient {
         })
     }
 
-    fn next_response(&self, until: Instant) -> Result<Option<Message>> {
+    fn next_response(&self, until: Option<Instant>) -> Result<Option<Message>> {
         let mut state = self.inbox.lock();
         loop {
             if let Some(message) = state.responses.pop_front() {
@@ -893,7 +904,7 @@ impl TurnClient {
             if let Some(reason) = &state.closed {
                 return Err(Error::Network(format!("TURN transport closed: {reason}")));
             }
-            match self.inbox.wait(state, Some(until)) {
+            match self.inbox.wait(state, until) {
                 Some(next) => state = next,
                 None => return Ok(None),
             }

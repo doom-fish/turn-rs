@@ -539,3 +539,42 @@ fn username_anonymity_sends_userhash() {
         Some(common::sha256(format!("{USER}:{REALM}").as_bytes()))
     );
 }
+
+#[test]
+fn unbounded_timeouts_do_not_overflow() {
+    let server = Server::start(|session, request| {
+        session.standard(request);
+        if is_request(request, Method::CreatePermission) && session.authenticated(request) {
+            session.data_indication(peer_address(), b"late");
+        }
+    });
+    let mut client = allocated(&server);
+    client.create_permission(&[peer_address()]).unwrap();
+    let (_, payload) = client.recv(Some(Duration::MAX)).unwrap();
+    assert_eq!(payload, b"late");
+    client.close(Duration::MAX).unwrap();
+    assert!(requests_of(&server.requests(), Method::Refresh)
+        .iter()
+        .any(|r| lifetime_of(r) == Some(0)));
+}
+
+#[test]
+fn allocation_mismatch_on_refresh_drops_the_allocation() {
+    let server = Server::start(|session, request| {
+        if is_request(request, Method::Refresh) && session.authenticated(request) {
+            session.error(request, 437, Vec::new(), true);
+            return;
+        }
+        session.standard(request);
+    });
+    let mut client = allocated(&server);
+    client.create_permission(&[peer_address()]).unwrap();
+    let error = client.refresh(Duration::from_secs(300)).unwrap_err();
+    assert!(
+        matches!(error, Error::Server { code: 437, .. }),
+        "{error:?}"
+    );
+    assert!(client.allocation().is_none());
+    assert!(client.permissions().is_empty());
+    assert_eq!(client.next_maintenance(), None);
+}
