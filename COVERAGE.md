@@ -9,6 +9,7 @@ implements, and what is intentionally deferred.
 | ---- | ----- | ------ |
 | [RFC 5766] | Traversal Using Relays around NAT (TURN) | Client implemented |
 | [RFC 8656] | TURN (bis) | Dual-stack attributes implemented; happy-eyeballs deferred |
+| [RFC 8489] §9.2 | Long-term credential mechanism | Implemented, including `PASSWORD-ALGORITHMS`, `USERHASH`, and response authentication |
 | [RFC 6156] | TURN Extension for IPv6 | `REQUESTED-ADDRESS-FAMILY` implemented |
 
 ## Methods
@@ -38,8 +39,10 @@ implements, and what is intentionally deferred.
 | `RESERVATION-TOKEN` | `0x0022` | ✅ | ✅ | 8-byte token |
 | `ADDITIONAL-ADDRESS-FAMILY` | `0x8000` | ✅ | ✅ | dual-stack (RFC 8656 §14.9) |
 
-Integrity, fingerprint, `USERNAME`, `REALM`, `NONCE`, and `ERROR-CODE` are
-handled by the sibling `stun-rs` crate.
+Integrity, fingerprint, `USERNAME`, `REALM`, `NONCE`, `PASSWORD-ALGORITHM`, and
+`ERROR-CODE` are handled by the sibling `stun-rs` crate. `PASSWORD-ALGORITHMS`
+(`0x8002`) and `USERHASH` (`0x001E`) are built and parsed in this crate's `auth`
+module.
 
 ✅ implemented · ⚠️ partial / passthrough
 
@@ -68,20 +71,63 @@ and discards trailing padding regardless of transport. This is enforced by the
 ## Authentication
 
 Long-term authentication is mandatory for TURN. Requests
-(`Allocate`/`Refresh`/`CreatePermission`/`ChannelBind`) run an auth retry loop:
-the first attempt is unauthenticated; a `401` supplies `REALM`/`NONCE`; the
-request is retried with `USERNAME`/`REALM`/`NONCE` and `MESSAGE-INTEGRITY`; a
-`438` (stale nonce) captures a fresh `NONCE` and retries. Each attempt uses a
-new transaction ID. `Send`/`Data` indications are not authenticated, per
-RFC 5766 §10.
+(`Allocate`/`Refresh`/`CreatePermission`/`ChannelBind`) run an auth retry loop
+(RFC 8489 §9.2): the first attempt is unauthenticated; a `401` supplies
+`REALM`/`NONCE`; the request is retried with `USERNAME`/`REALM`/`NONCE` and
+`MESSAGE-INTEGRITY`; a `438` (stale nonce) captures a fresh `NONCE` and retries.
+Each attempt uses a new transaction ID. `Send`/`Data` indications are not
+authenticated, per RFC 5766 §10.
+
+- **Response authentication.** Every response to an authenticated request must
+  carry the integrity attribute the request used, verified with the long-term
+  key, and a valid `FINGERPRINT` when one is present. Other responses are
+  discarded and retransmission continues; if nothing authenticated arrives the
+  request fails with `Error::IntegrityViolation`. Over TCP/TLS there is no
+  retransmission, and the first discarded response ends the request.
+- **State changes.** The realm, nonce, and key are stored only after an
+  authenticated response. The initial `401` is accepted unauthenticated (it
+  cannot be anything else); a pinned credential realm must match it. Later
+  unauthenticated `401`s are ignored, and an unauthenticated `438` can trigger a
+  retry with its nonce but does not replace the stored nonce unless the retry is
+  answered with an authenticated response. A `438` never changes the realm.
+  Responses to earlier attempts of the same request remain acceptable.
+- **Credential rejection.** A second `401` for the same realm during the
+  initial exchange means the password is wrong; the client does not retry and
+  returns `Error::AuthFailed` at once.
+- **`PASSWORD-ALGORITHMS`.** The nonce cookie (`obMatJos2` plus the security
+  feature bits) is parsed. If it announces password algorithms but the
+  attribute is missing, or the list has neither MD5 nor SHA-256, the client does
+  not retry. Otherwise it picks the first supported entry, derives the key
+  (`SHA-256(username:realm:password)` or the MD5 form), echoes the list with
+  `PASSWORD-ALGORITHM`, and authenticates every later request with
+  `MESSAGE-INTEGRITY-SHA256` only. A `438` must repeat the same list.
+- **`USERHASH`.** When the nonce cookie sets the username-anonymity bit, the
+  client sends `USERHASH = SHA-256(username:realm)` instead of `USERNAME`.
+- **Secrets.** `Credential` keeps the password and `AuthState` the key in
+  zeroizing buffers; neither prints them in `Debug`.
+- **OpaqueString.** Realm and password are used as UTF-8 bytes; the RFC 8265
+  OpaqueString profile is not applied, which only matters for non-ASCII values.
+
+## Receive path
+
+A background thread reads the transport and sorts what arrives. STUN responses
+go to the waiting request; `Data` indications and ChannelData frames go to a
+bounded pending queue (`DEFAULT_PENDING_CAPACITY` = 256 frames, adjustable with
+`set_pending_capacity`) that drops its oldest frame when full and counts drops
+(`dropped_frames`). Waiting for a response runs against a deadline, so relayed
+media never consumes retransmissions. `recv` skips malformed frames, `Data`
+indications from peers without a permission, and ChannelData on unbound
+channels. `close(timeout)` releases the allocation with a bounded wait, cancels
+the transport, and joins the receiver thread; `Drop` does the same with a 1 s
+bound.
 
 ## Transports
 
 | Transport | URI | Status |
 | --------- | --- | ------ |
-| UDP | `turn:` | ✅ implemented, default, live-tested path |
-| TCP | `turn:?transport=tcp` | ✅ implemented, length-prefixed reassembly |
-| TLS | `turns:` | ✅ compiles and frames as TCP; not live-tested |
+| UDP | `turn:` | ✅ implemented, default; tested against an in-process loopback server |
+| TCP | `turn:?transport=tcp` | ✅ implemented, length-prefixed reassembly; no end-to-end test |
+| TLS | `turns:` | ✅ compiles and frames as TCP; no end-to-end test |
 
 ## Deferred
 
@@ -91,7 +137,12 @@ RFC 5766 §10.
 - RFC 8656 happy-eyeballs ordering between dual-stack relayed candidates.
 - A background auto-refresh worker thread; refresh is cooperative
   (`maintain` / `next_maintenance`) by design.
+- `ALTERNATE-SERVER` redirects (`300 Try Alternate`): an authenticated `300`
+  is reported as `Error::Server`, an unauthenticated one is discarded.
+- `MESSAGE-INTEGRITY-SHA256` truncation: responses must carry the full 32-byte
+  value.
 
 [RFC 5766]: https://www.rfc-editor.org/rfc/rfc5766
 [RFC 8656]: https://www.rfc-editor.org/rfc/rfc8656
+[RFC 8489]: https://www.rfc-editor.org/rfc/rfc8489
 [RFC 6156]: https://www.rfc-editor.org/rfc/rfc6156

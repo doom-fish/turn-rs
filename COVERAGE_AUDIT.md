@@ -12,10 +12,11 @@ the TURN layer is delegated to siblings:
 
 | Capability | Provided by | Notes |
 | ---------- | ----------- | ----- |
-| Message framing, integrity, fingerprint | `stun-rs` | `MESSAGE-INTEGRITY` (HMAC-SHA1), `FINGERPRINT` (CRC-32) |
+| Message framing, integrity, fingerprint | `stun-rs` | `MESSAGE-INTEGRITY` (HMAC-SHA1), `MESSAGE-INTEGRITY-SHA256` (CryptoKit HMAC), `FINGERPRINT` (CRC-32) |
 | Long-term key `MD5(user:realm:pass)` | `stun-rs` (`auth::long_term_key`) | CommonCrypto `CC_MD5` |
-| Transaction-ID CSPRNG | `stun-rs` (`TransactionId::random`) | `SecRandomCopyBytes` |
-| UDP / TCP / TLS transport | `networkframework-rs` | Network.framework |
+| Long-term key `SHA-256(user:realm:pass)` and `USERHASH` | `cryptokit-rs` (`hashing::sha256`) | CryptoKit |
+| Transaction-ID CSPRNG | `stun-rs` (`TransactionId::try_random`) | `SecRandomCopyBytes` |
+| UDP / TCP / TLS transport | `networkframework-rs` | Network.framework (`Connection` for UDP, cancelled on close) |
 
 `build.rs` links `Security.framework` only to mirror the sibling crates' link
 flags; this crate calls into it transitively, not directly.
@@ -25,7 +26,10 @@ flags; this crate calls into it transitively, not directly.
 | Area | RFC | Covered | Gaps |
 | ---- | --- | ------- | ---- |
 | `Allocate` + relayed address | 5766 §6 | ✅ | UDP relays only |
-| Long-term auth challenge loop | 5766 §4 | ✅ `401`→resend, `438`→resend | — |
+| Long-term auth challenge loop | 5766 §4, 8489 §9.2 | ✅ `401`→resend, `438`→resend | OpaqueString not applied |
+| Response authentication | 8489 §9.2.5 | ✅ integrity + `FINGERPRINT` checked before acting | unauthenticated `401`/`438` never change stored state |
+| `PASSWORD-ALGORITHMS` / `PASSWORD-ALGORITHM` | 8489 §9.2, §14.11–14.12 | ✅ MD5 and SHA-256, bid-down detection | — |
+| `USERHASH` | 8489 §14.4 | ✅ when the nonce cookie asks for it | — |
 | `Refresh` + lifetime release | 5766 §7 | ✅ incl. `LIFETIME=0` | — |
 | `CreatePermission` | 5766 §9 | ✅ | — |
 | `Send` / `Data` indications | 5766 §10 | ✅ unauthenticated | — |
@@ -43,9 +47,10 @@ flags; this crate calls into it transitively, not directly.
 ## Honest notes
 
 - **TLS is framed identically to TCP and is not live-tested.** `turns:` selects
-  a TLS transport that reuses the TCP length-prefixed reassembler; it compiles
-  and is exercised by unit tests through the shared framing code, but there is
-  no end-to-end test against a TLS relay.
+  a TLS transport that reuses the TCP length-prefixed reassembler; it compiles,
+  but no test exercises the TCP or TLS transports end to end. The UDP transport
+  and every authentication path are tested against a scripted TURN server on
+  `127.0.0.1`, including forged responses.
 - **Auto-refresh is cooperative, not threaded.** Allocation, permission, and
   channel-binding lifetimes are tracked, but renewal happens only when the
   caller invokes `maintain`; `next_maintenance` reports the soonest due

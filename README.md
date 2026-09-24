@@ -28,17 +28,28 @@ NAT fail.
 - **ChannelData** — 4-byte framing with first-byte STUN/ChannelData
   demultiplexing and RFC-compliant 4-byte padding (RFC 5766 §11.5,
   RFC 8656 §12.4).
-- **Long-term auth** — the mandatory `MESSAGE-INTEGRITY` mechanism with the full
-  `401` challenge → re-send and `438` stale-nonce → re-send state machine, keyed
-  on `MD5(username:realm:password)` from `stun-rs`.
+- **Long-term auth** — the mandatory mechanism of RFC 8489 §9.2 with the full
+  `401` challenge → re-send and `438` stale-nonce → re-send state machine.
+  Without `PASSWORD-ALGORITHMS` the key is `MD5(username:realm:password)` from
+  `stun-rs` and requests carry `MESSAGE-INTEGRITY`; when the server offers
+  `PASSWORD-ALGORITHMS`, the first supported algorithm (SHA-256 or MD5) is
+  chosen, echoed with `PASSWORD-ALGORITHM`, and requests carry
+  `MESSAGE-INTEGRITY-SHA256`. `USERHASH` is sent when the nonce cookie asks for
+  username anonymity.
+- **Authenticated responses** — a response is acted on only after its
+  message integrity verifies with the long-term key (and its `FINGERPRINT`,
+  when present). The initial `401` is the only unauthenticated response the
+  client uses; a forged `401` or `438` can make it retry but never replaces the
+  realm, nonce, or key it has stored.
 - **Lifetime accounting** — allocation, permission, and channel-binding
   expiry tracking with a cooperative auto-refresh helper.
 - **Transports** — a synchronous client over UDP (default), TCP, and TLS,
   selected by the `turn:` / `turns:` URI scheme.
 
-There are **no third-party runtime dependencies**: only `libc` and the sibling
-`stun-rs` / `networkframework` crates. Cryptography and the transport come from
-Apple system libraries by way of those crates.
+The only third-party runtime dependency is `zeroize`, which clears the password
+and derived keys; everything else comes from the sibling `stun-rs`,
+`cryptokit-rs`, and `networkframework` crates. Cryptography and the transport
+come from Apple system libraries by way of those crates.
 
 ## Quick start
 
@@ -63,14 +74,29 @@ let channel = client.channel_bind(peer)?;
 client.send_channel(channel, b"hello again")?;
 
 // Receive relayed data (Data indications or ChannelData frames):
-let (from, data) = client.recv()?;
+let (from, data) = client.recv(Some(Duration::from_secs(5)))?;
 println!("{} bytes from {from}", data.len());
 
 client.refresh(Duration::from_secs(600))?;
-drop(client); // releases the allocation with a zero-lifetime Refresh
+// Release the allocation with a zero-lifetime Refresh, waiting at most 2 s:
+client.close(Duration::from_secs(2))?;
 # Ok(())
 # }
 ```
+
+Dropping the client also releases the allocation, but waits no longer than
+`turn::client::DROP_CLOSE_TIMEOUT` (1 s) for the server's answer.
+
+### Relayed data while a request is in flight
+
+A background thread sorts everything the server sends. Responses go to the
+request waiting for them; `Data` indications and ChannelData frames wait in a
+bounded pending queue until `recv` takes them, so media flowing during a
+`Refresh` or `ChannelBind` never delays or fails the request. When the queue is
+full (`DEFAULT_PENDING_CAPACITY` frames, adjustable with
+`set_pending_capacity`), the oldest frame is dropped and counted by
+`dropped_frames`. `recv` skips malformed frames, `Data` indications from peers
+without a permission, and ChannelData on unbound channels.
 
 ### Keeping an allocation alive
 
@@ -102,11 +128,8 @@ cargo run --example 01_allocate
 # Encode/decode ChannelData and demonstrate STUN/ChannelData demux (offline):
 cargo run --example 02_channel_data
 
-# Live allocation against a real TURN server (network + credentials):
-TURN_LIVE_TESTS=1 \
-TURN_URL=turn:turn.example.org:3478 \
-TURN_USER=alice TURN_REALM=example.org TURN_PASS=s3cr3t \
-cargo run --example 03_live_allocate
+# Allocate against an in-process TURN server on 127.0.0.1 (offline):
+cargo run --example 03_loopback_allocate
 ```
 
 ## Platform
@@ -117,7 +140,7 @@ cryptography comes from Apple system libraries via `stun-rs`.
 
 ## Minimum Supported Rust Version
 
-Rust **1.76**.
+Rust **1.82**.
 
 ## License
 
