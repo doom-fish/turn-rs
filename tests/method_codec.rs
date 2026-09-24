@@ -11,7 +11,7 @@ fn build(method: Method, attrs: &[Attribute]) -> Vec<u8> {
     for attr in attrs {
         builder = builder.attribute(attr.to_stun(&key));
     }
-    builder.build_and_encode()
+    builder.build_and_encode().unwrap()
 }
 
 #[test]

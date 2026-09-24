@@ -2,7 +2,7 @@
 name = "turn-rs"
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.76"
+rust-version = "1.82"
 license = "MIT OR Apache-2.0"
 description = "Pure-Rust TURN (RFC 5766 / RFC 8656) client layered on stun-rs, with Allocate/Refresh/Send/Data/CreatePermission/ChannelBind, ChannelData framing, and long-term auth"
 authors = ["Per Johansson <per@doom.fish>"]
@@ -20,9 +20,9 @@ path = "src/lib.rs"
 crate-type = ["lib"]
 
 [dependencies]
-libc = "0.2"
-stun = { path = "../stun-rs", package = "stun-rs" }
-networkframework = { path = "../networkframework-rs" }
+stun = { path = "../stun-rs", package = "stun-rs", version = ">=0.2, <0.3" }
+networkframework = { path = "../networkframework-rs", version = ">=0.14, <0.15" }
+zeroize = ">=1.6, <1.9"
 
 [[example]]
 name = "01_allocate"

@@ -9,6 +9,7 @@
 //! `438 Stale Nonce`, the client captures the fresh `NONCE` and retries.
 
 use stun::auth::long_term_key;
+use zeroize::Zeroizing;
 
 /// A TURN credential.
 ///
@@ -74,7 +75,7 @@ impl Credential {
     ///
     /// `MD5(username ":" realm ":" password)` per RFC 5766 §4 / RFC 5389 §15.4.
     #[must_use]
-    pub fn long_term_key(&self, realm: &str) -> [u8; 16] {
+    pub fn long_term_key(&self, realm: &str) -> Zeroizing<Vec<u8>> {
         long_term_key(self.username(), realm, self.password())
     }
 }
@@ -88,7 +89,7 @@ impl Credential {
 pub struct AuthState {
     realm: Option<String>,
     nonce: Option<String>,
-    key: Option<[u8; 16]>,
+    key: Option<Zeroizing<Vec<u8>>>,
 }
 
 impl AuthState {
@@ -135,8 +136,8 @@ impl AuthState {
 
     /// The cached long-term HMAC key, once a challenge has been processed.
     #[must_use]
-    pub fn key(&self) -> Option<&[u8; 16]> {
-        self.key.as_ref()
+    pub fn key(&self) -> Option<&[u8]> {
+        self.key.as_deref().map(Vec::as_slice)
     }
 
     /// Whether the state is ready to authenticate a request (a challenge has

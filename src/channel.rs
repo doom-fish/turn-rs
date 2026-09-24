@@ -94,7 +94,7 @@ impl ChannelData {
         out.extend_from_slice(&channel.to_be_bytes());
         out.extend_from_slice(&len.to_be_bytes());
         out.extend_from_slice(payload);
-        out.extend(std::iter::repeat(0u8).take(padding));
+        out.extend(std::iter::repeat_n(0u8, padding));
         Ok(out)
     }
 

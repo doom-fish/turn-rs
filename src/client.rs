@@ -19,7 +19,7 @@ use std::str::FromStr;
 use std::sync::mpsc;
 use std::sync::Arc;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use stun::transaction::RetransmitSchedule;
 use stun::{Attribute as StunAttribute, Class, Message, TransactionId};
@@ -377,7 +377,7 @@ impl TurnClient {
             .transaction_id(tid)
             .attribute(Attribute::XorPeerAddress(peer).to_stun(&key))
             .attribute(Attribute::Data(payload.to_vec()).to_stun(&key))
-            .build_and_encode();
+            .build_and_encode()?;
         self.transport.send(&bytes)
     }
 
@@ -527,7 +527,7 @@ impl TurnClient {
     fn authed_request(&mut self, method: Method, attrs: &[Attribute]) -> Result<Message> {
         for _ in 0..MAX_AUTH_ATTEMPTS {
             let tid = TransactionId::random();
-            let bytes = self.build_request(tid, method, attrs);
+            let bytes = self.build_request(tid, method, attrs)?;
             let response = self.transact(tid, &bytes)?;
 
             match response.class() {
@@ -570,7 +570,12 @@ impl TurnClient {
 
     /// Build a request's wire bytes, attaching credentials + `MESSAGE-INTEGRITY`
     /// once the auth state is ready.
-    fn build_request(&self, tid: TransactionId, method: Method, attrs: &[Attribute]) -> Vec<u8> {
+    fn build_request(
+        &self,
+        tid: TransactionId,
+        method: Method,
+        attrs: &[Attribute],
+    ) -> Result<Vec<u8>> {
         let key = attribute::xor_key(tid.as_bytes());
         let mut builder = Message::builder(method.to_stun(), Class::Request).transaction_id(tid);
         for attr in attrs {
@@ -587,7 +592,7 @@ impl TurnClient {
                 .attribute(StunAttribute::Nonce(nonce.to_owned()))
                 .with_message_integrity_sha1(long_key);
         }
-        builder.build_and_encode()
+        Ok(builder.build_and_encode()?)
     }
 
     /// Send a request and wait for the matching response, driving RFC 5389
@@ -595,30 +600,35 @@ impl TurnClient {
     /// [`TurnClient::recv`].
     fn transact(&mut self, tid: TransactionId, request: &[u8]) -> Result<Message> {
         self.transport.send(request)?;
-        for wait in RetransmitSchedule::new() {
-            match self.rx.recv_timeout(wait) {
-                Ok(datagram) => {
-                    if channel::classify(&datagram) == PacketKind::Stun {
-                        if let Ok(message) = Message::decode(&datagram) {
-                            if message.transaction_id() == &tid
-                                && matches!(
-                                    message.class(),
-                                    Class::SuccessResponse | Class::ErrorResponse
-                                )
-                            {
-                                return Ok(message);
+        let mut schedule = RetransmitSchedule::new().peekable();
+        while let Some(wait) = schedule.next() {
+            let started = Instant::now();
+            while let Some(remaining) = wait.checked_sub(started.elapsed()) {
+                match self.rx.recv_timeout(remaining) {
+                    Ok(datagram) => {
+                        if channel::classify(&datagram) == PacketKind::Stun {
+                            if let Ok(message) = Message::decode(&datagram) {
+                                if message.transaction_id() == &tid
+                                    && matches!(
+                                        message.class(),
+                                        Class::SuccessResponse | Class::ErrorResponse
+                                    )
+                                {
+                                    return Ok(message);
+                                }
                             }
                         }
+                        // Not our response: it may be relayed data — stash it.
+                        let _ = self.process_inbound(&datagram)?;
                     }
-                    // Not our response: it may be relayed data — stash it.
-                    let _ = self.process_inbound(&datagram)?;
+                    Err(mpsc::RecvTimeoutError::Timeout) => break,
+                    Err(mpsc::RecvTimeoutError::Disconnected) => {
+                        return Err(Error::Network("transport receiver closed".into()))
+                    }
                 }
-                Err(mpsc::RecvTimeoutError::Timeout) => {
-                    self.transport.send(request)?;
-                }
-                Err(mpsc::RecvTimeoutError::Disconnected) => {
-                    return Err(Error::Network("transport receiver closed".into()))
-                }
+            }
+            if schedule.peek().is_some() {
+                self.transport.send(request)?;
             }
         }
         Err(Error::Timeout)

@@ -30,7 +30,7 @@ fn challenge_makes_state_ready() {
     assert_eq!(state.nonce(), Some("nonce-1"));
     // Key is MD5(username:realm:password) per RFC 5389 §15.4.
     let expected = stun::auth::long_term_key("alice", "example.org", "password");
-    assert_eq!(state.key(), Some(&expected));
+    assert_eq!(state.key(), Some(expected.as_slice()));
 }
 
 #[test]
@@ -38,11 +38,11 @@ fn refresh_nonce_updates_only_nonce() {
     let mut state = AuthState::new();
     let cred = Credential::long_term("alice", "", "password");
     state.challenge(&cred, "example.org", "nonce-1");
-    let key_before = *state.key().unwrap();
+    let key_before = state.key().unwrap().to_vec();
     state.refresh_nonce("nonce-2");
     assert_eq!(state.nonce(), Some("nonce-2"));
     assert_eq!(state.realm(), Some("example.org"));
-    assert_eq!(state.key(), Some(&key_before));
+    assert_eq!(state.key(), Some(key_before.as_slice()));
 }
 
 /// A scripted in-memory TURN server. It answers an unauthenticated `Allocate`
@@ -94,6 +94,7 @@ impl MockServer {
                 .attribute(StunAttribute::Realm(REALM.to_owned()))
                 .attribute(StunAttribute::Nonce(NONCE.to_owned()))
                 .build_and_encode()
+                .unwrap()
         } else if method == Method::Allocate.to_stun() {
             self.state.lock().unwrap().authed_allocates += 1;
             let relayed = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 33)), 51000);
@@ -104,12 +105,14 @@ impl MockServer {
                 .attribute(StunAttribute::XorMappedAddress(mapped))
                 .attribute(Attribute::Lifetime(600).to_stun(&key))
                 .build_and_encode()
+                .unwrap()
         } else {
             // e.g. the zero-lifetime Refresh sent on drop.
             Message::builder(method, Class::SuccessResponse)
                 .transaction_id(tid)
                 .attribute(Attribute::Lifetime(0).to_stun(&key))
                 .build_and_encode()
+                .unwrap()
         };
 
         let mut guard = self.state.lock().unwrap();

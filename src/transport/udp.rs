@@ -1,6 +1,7 @@
 //! UDP transport for TURN (RFC 5766 default).
 
 use networkframework::udp::UdpClient;
+use networkframework::NetworkError;
 
 use crate::error::{Error, Result};
 use crate::transport::Transport;
@@ -34,9 +35,11 @@ impl Transport for UdpTransport {
     }
 
     fn receive(&self) -> Result<Vec<u8>> {
-        self.socket
-            .receive(MAX_DATAGRAM)
-            .map_err(|e| Error::Network(e.to_string()))
+        match self.socket.receive(MAX_DATAGRAM) {
+            Ok(datagram) => Ok(datagram),
+            Err(NetworkError::MessageTooLarge { .. }) => Ok(Vec::new()),
+            Err(e) => Err(Error::Network(e.to_string())),
+        }
     }
 
     fn is_stream(&self) -> bool {

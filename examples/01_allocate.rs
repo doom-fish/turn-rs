@@ -40,7 +40,8 @@ fn main() {
         .attribute(StunAttribute::Realm(realm.to_owned()))
         .attribute(StunAttribute::Nonce(nonce.to_owned()))
         .with_message_integrity_sha1(&key)
-        .build();
+        .build()
+        .expect("build Allocate request");
 
     let bytes = request.encode();
     println!("Allocate request ({} bytes):", bytes.len());
